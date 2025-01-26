@@ -8,7 +8,7 @@ import time
 from functools import wraps
 import pickle
 
-# Enhanced logging configuration
+# Logging configuration
 def setup_logging():
     log_dir = "logs"
     if not os.path.exists(log_dir):
@@ -75,9 +75,9 @@ def exponential_backoff_retry(max_retries=None, initial_delay=1, max_delay=60):
     return decorator
 
 class ProcessingState:
-    def __init__(self, state_file="processing_state.pkl"):
+    def __init__(self, state_file="BORA_processing_state.pkl"):
         self.state_file = state_file
-        self.last_processed_idx = None  # Changed to None as default
+        self.last_processed_idx = None
         self.processed_chunks = set()
         self.load_state()
     
@@ -122,109 +122,123 @@ def chunk_text(text, max_chars=2000):
     return chunks
 
 # JSON Schema definitions
-QUESTION_SCHEMA = {
+QUESTIONS_SCHEMA = {
     "type": "object",
     "properties": {
-        "pregunta": {
-            "type": "string",
-            "description": "Una pregunta relevante basada en el contexto proporcionado"
+        "preguntas": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "pregunta": {
+                        "type": "string",
+                        "description": "Una pregunta relevante basada en el contexto proporcionado"
+                    },
+                    "razonamiento": {
+                        "type": "string",
+                        "description": "Explicación del enfoque de la pregunta"
+                    }
+                },
+                "required": ["pregunta", "razonamiento"]
+            },
+            "minItems": 2,
+            "maxItems": 2
         }
     },
-    "required": ["pregunta"]
+    "required": ["preguntas"]
+}
+
+CONTENT_EVALUATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "is_valuable": {
+            "type": "boolean",
+            "description": "Whether the content is valuable for the dataset"
+        },
+        "reason": {
+            "type": "string",
+            "description": "Explanation for the evaluation decision"
+        }
+    },
+    "required": ["is_valuable", "reason"]
+}
+
+QUESTION_EVALUATION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "selected_question": {
+            "type": ["integer", "null"],
+            "enum": [1, 2, None],
+            "description": "Which question was selected (1, 2, or null if none)"
+        },
+        "reason": {
+            "type": "string",
+            "description": "Explanation for the selection decision"
+        }
+    },
+    "required": ["selected_question", "reason"]
 }
 
 @exponential_backoff_retry(max_retries=None)
 def generate_question(context):
-    """Generate a question based on the context."""
-    logger.debug("Generating question for context of length %d", len(context))
+    """Generate two different questions based on the context."""
+    logger.debug("Generating questions for context of length %d", len(context))
     prompt = f"""Actúa como un abogado buscando información legal.
-            Genera una pregunta natural que:
-            1. Sea autocontenida y no haga referencia al texto o contexto
-            2. Use lenguaje cotidiano mezclado con términos legales relevantes
-            3. Represente una duda real sobre el tema principal del texto
-            4. Sea clara y específica, evitando ambigüedades o generalidades
-            5. Evite frases como "según el texto", "de acuerdo a la ley", "en este caso", etc.
+            Genera DOS preguntas diferentes que:
+            1. Sean autocontenidas y no hagan referencia al texto o contexto
+            2. Usen lenguaje cotidiano mezclado con términos legales relevantes
+            3. Representen dudas reales sobre el tema principal del texto
+            4. Sean claras y específicas, evitando ambigüedades o generalidades
+            5. Eviten frases como "según el texto", "de acuerdo a la ley", "en este caso", etc.
+            6. Sean distintas entre sí en enfoque o aspecto del tema que abordan
             
-            Ejemplos de buenas preguntas:
-            ✓ "¿Cuáles son los requisitos para registrar una marca comercial?"
-            ✓ "¿Qué documentación necesito para iniciar un trámite de jubilación?"
-            ✓ "¿Cómo funciona el proceso de declaración de herederos?"
-            
-            Ejemplos de malas preguntas:
-            ✗ "Según esta normativa, ¿qué documentos se requieren?"
-            ✗ "De acuerdo al texto, ¿cuál es el procedimiento?"
-            ✗ "¿Qué establece esta ley sobre el tema?"
+            Las preguntas deben ser diferentes pero igualmente válidas.
+            Incluye un razonamiento breve que explique el enfoque de cada pregunta.
             
             Fragmento a analizar: {context}
             
-            Responde con un JSON que contenga la pregunta"""
+            Responde con un JSON que contenga el array de preguntas y sus razonamientos"""
 
     try:
         response = client.chat.completions.create(
             model="",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.7,
-            response_format={ "type": "json_object", "json_schema": QUESTION_SCHEMA }
+            response_format={ "type": "json_object", "json_schema": QUESTIONS_SCHEMA }
         )
         
         content = response.choices[0].message.content
         logger.info(f"LLM Response: {content}")
         
         result = json.loads(content)
-        if "pregunta" not in result:
-            logger.error(f"Invalid response format. Expected 'pregunta' key. Got: {result}")
-            return "¿Qué información relevante contiene este texto?"  # fallback question
-            
-        return result["pregunta"]
+        return result["preguntas"]
     except Exception as e:
-        logger.error(f"Error generating question: {str(e)}")
-        return "¿Qué información relevante contiene este texto?"  # fallback question
+        logger.error(f"Error generating questions: {str(e)}")
+        return [{"pregunta": "¿Qué información relevante contiene este texto?", "razonamiento": "Pregunta por defecto"}]
 
 @exponential_backoff_retry(max_retries=None)
-def evaluate_content_quality(context, question=None):
-    """Evaluate if the content and question (if provided) are suitable for the dataset."""
+def evaluate_content_quality(context, questions=None):
+    """Evaluate content and questions for RAG dataset suitability."""
     
-    # Context-only evaluation prompt
-    context_prompt = """Actúa como un evaluador experto en calidad de datos para sistemas RAG.
-    Analiza si este fragmento de texto legal es adecuado como fuente de información según estos criterios:
+    if questions is None:
+        # Context-only evaluation prompt
+        context_prompt = """Actúa como un evaluador experto en calidad de datos para sistemas RAG.
+        Analiza si este fragmento de texto legal es adecuado como fuente de información según estos criterios:
 
-    Criterios de evaluación del contenido:
-    1. Sustancia legal: contiene normas, procedimientos o conceptos legales relevantes
-    2. Aplicabilidad práctica: aborda situaciones o consultas realistas
-    3. Claridad: la información está expresada de manera estructurada
-    4. Potencial de consulta: podría responder a consultas específicas
-    
-    Contexto a evaluar: {context}
-    
-    Responde con un JSON que contenga:
-    {{
-        "is_valuable": true/false,
-        "reason": "Explicación de la decisión"
-    }}"""
+        Criterios de evaluación del contenido:
+        1. Sustancia legal: contiene normas, procedimientos o conceptos legales relevantes
+        2. Aplicabilidad práctica: aborda situaciones o consultas realistas
+        3. Potencial de consulta: podría responder a consultas específicas
+        
+        Contexto a evaluar: {context}
+        
+        Responde con un JSON que contenga:
+        {{
+            "is_valuable": true/false,
+            "reason": "Explicación de la decisión"
+        }}"""
 
-    # Question evaluation prompt
-    question_prompt = """Actúa como un evaluador experto en calidad de datos para sistemas RAG.
-    Analiza si esta pregunta es adecuada para entrenar un sistema RAG según estos criterios:
-
-    Criterios de evaluación de la pregunta:
-    1. Naturalidad: refleja consultas reales de abogados
-    2. Utilidad pedagógica: ayuda al modelo a aprender asociaciones semánticas
-    
-    IMPORTANTE: Rechazar preguntas que contengan frases como "según el texto", 
-    "de acuerdo a la ley", "en este caso", o similares referencias al contexto.
-    
-    Contexto: {context}
-    Pregunta: {question}
-    
-    Responde con un JSON que contenga:
-    {{
-        "is_valuable": true/false,
-        "reason": "Explicación detallada de la decisión"
-    }}"""
-
-    try:
-        if question is None:
-            # Evaluate just the context
+        try:
             response = client.chat.completions.create(
                 model="",
                 messages=[{
@@ -232,28 +246,64 @@ def evaluate_content_quality(context, question=None):
                     "content": context_prompt.format(context=context)
                 }],
                 temperature=0.3,
-                response_format={ "type": "json_object" }
+                response_format={ "type": "json_object", "json_schema": CONTENT_EVALUATION_SCHEMA }
             )
-        else:
-            # Evaluate the question
+            
+            result = json.loads(response.choices[0].message.content)
+            return result.get("is_valuable", False), result.get("reason", "No reason provided")
+        except Exception as e:
+            logger.error(f"Error evaluating quality: {str(e)}")
+            return False, "Error in evaluation"
+    else:
+        question_eval_prompt = """Actúa como un evaluador experto en calidad de datos para sistemas RAG.
+        Analiza estas dos preguntas y selecciona la más adecuada para entrenar un sistema RAG, o ninguna si ambas son inadecuadas.
+
+        Criterios de evaluación:
+        1. Naturalidad: refleja consultas reales de usuarios
+        2. Utilidad para embeddings: ayuda al modelo a aprender asociaciones semánticas
+        3. Relevancia contextual: se relaciona directamente con el contenido principal
+        4. Especificidad: es precisa y bien enfocada
+        5. Independencia: no hace referencia al texto fuente
+
+        Contexto: {context}
+
+        Pregunta 1: {q1}
+        Razonamiento 1: {r1}
+
+        Pregunta 2: {q2}
+        Razonamiento 2: {r2}
+
+        Responde con un JSON:
+        {{
+            "selected_question": null/1/2,
+            "reason": "Explicación de la selección"
+        }}"""
+
+        try:
             response = client.chat.completions.create(
                 model="",
                 messages=[{
                     "role": "user", 
-                    "content": question_prompt.format(
+                    "content": question_eval_prompt.format(
                         context=context,
-                        question=question
+                        q1=questions[0]["pregunta"],
+                        r1=questions[0]["razonamiento"],
+                        q2=questions[1]["pregunta"],
+                        r2=questions[1]["razonamiento"]
                     )
                 }],
                 temperature=0.3,
-                response_format={ "type": "json_object" }
+                response_format={ "type": "json_object", "json_schema": QUESTION_EVALUATION_SCHEMA }
             )
-        
-        result = json.loads(response.choices[0].message.content)
-        return result.get("is_valuable", False), result.get("reason", "No reason provided")
-    except Exception as e:
-        logger.error(f"Error evaluating quality: {str(e)}")
-        return False, "Error in evaluation"
+            
+            result = json.loads(response.choices[0].message.content)
+            selected = result.get("selected_question")
+            reason = result.get("reason", "No reason provided")
+            
+            return (selected is not None, reason, selected)
+        except Exception as e:
+            logger.error(f"Error evaluating questions: {str(e)}")
+            return False, "Error in evaluation", None
 
 def main():
     logger.info("Starting dataset processing")
@@ -268,7 +318,6 @@ def main():
         "rejected_chunks": 0
     }
     
-    # Get total length of dataset
     dataset_length = len(dataset)
     
     # Initialize last_processed_idx if None
@@ -277,7 +326,7 @@ def main():
     
     mode = "a" if state.last_processed_idx < dataset_length else "w"
     try:
-        with open("spanish_qa_dataset.jsonl", mode, encoding="utf-8") as f:
+        with open("BORA-Qs.jsonl", mode, encoding="utf-8") as f:
             # Iterate through dataset in reverse order
             for idx in range(dataset_length - 1, -1, -1):
                 logger.debug("Processing entry %d", idx)
@@ -303,22 +352,24 @@ def main():
                             logger.info(f"Skipping chunk {chunk_id}. Reason: {reason}")
                             continue
                         
-                        # Generate question
-                        question = generate_question(chunk)
+                        # Generate two questions
+                        questions = generate_question(chunk)
                         
-                        # Evaluate the question
-                        is_question_valuable, question_reason = evaluate_content_quality(chunk, question)
+                        # Evaluate and select the best question
+                        is_question_valuable, question_reason, selected = evaluate_content_quality(chunk, questions)
                         
                         if not is_question_valuable:
                             stats["rejected_chunks"] += 1
-                            logger.info(f"Rejecting question {chunk_id}. Reason: {question_reason}")
+                            logger.info(f"Rejecting questions for {chunk_id}. Reason: {question_reason}")
                             continue
                         
                         stats["accepted_chunks"] += 1
+                        selected_question = questions[selected - 1]
+                        
                         qa_pair = {
                             "id": chunk_id,
                             "context": chunk,
-                            "question": question
+                            "question": selected_question["pregunta"]
                         }
                         
                         f.write(json.dumps(qa_pair, ensure_ascii=False) + "\n")
